@@ -50,7 +50,10 @@ private:
     std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
     std::unique_ptr<nvinfer1::IExecutionContext> m_context;
     
-    cudaStream_t m_stream = nullptr;
+    // CUDA resources - separate streams for overlapping operations
+    cudaStream_t m_stream = nullptr;          // Backward compatibility (points to compute stream)
+    cudaStream_t m_compute_stream = nullptr;  // For inference operations
+    cudaStream_t m_transfer_stream = nullptr; // For memory transfers
     std::map<std::string, void*> m_gpu_buffers_map;
     unsigned char* m_pinned_buffer = nullptr;           // Pinned memory buffer on the host for raw capture data
     unsigned char* m_raw_capture_buffer_gpu = nullptr;  // Buffer on the GPU for the raw screen capture

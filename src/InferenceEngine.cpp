@@ -1,6 +1,7 @@
 // InferenceEngine.cpp
 #define NOMINMAX
 #include "../include/InferenceEngine.h"
+#include "../include/GPUBufferPool.h"
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -29,31 +30,46 @@ void MyLogger::log(Severity severity, const char* msg) noexcept {
 
 InferenceEngine::InferenceEngine() {
     m_runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(m_logger));
-    cudaStreamCreate(&m_stream);
+    
+    // Create separate streams for compute and memory transfers (performance optimization)
+    cudaStreamCreate(&m_compute_stream);
+    cudaStreamCreate(&m_transfer_stream);
+    m_stream = m_compute_stream; // Maintain backward compatibility
 
     // The capture resolution is hardcoded for now
     const int capture_width = 320;
     const int capture_height = 320;
     const size_t raw_capture_size = capture_width * capture_height * 4;
 
-    // Allocate GPU buffer for the raw capture
-    cudaMalloc(&m_raw_capture_buffer_gpu, raw_capture_size);
+    // Use buffer pool for GPU memory management
+    auto& pool = GPUBufferPool::GetInstance();
+    m_raw_capture_buffer_gpu = pool.GetBuffer(raw_capture_size);
     
     // Allocate Pinned Host Memory for raw capture input
     cudaHostAlloc((void**)&m_pinned_buffer, raw_capture_size, cudaHostAllocDefault);
 }
 
 InferenceEngine::~InferenceEngine() {
-    if (m_stream) cudaStreamDestroy(m_stream);
-    if (m_pinned_buffer) cudaFreeHost(m_pinned_buffer);
-    if (m_raw_capture_buffer_gpu) cudaFree(m_raw_capture_buffer_gpu);
+    // Clean up CUDA streams
+    if (m_compute_stream) cudaStreamDestroy(m_compute_stream);
+    if (m_transfer_stream) cudaStreamDestroy(m_transfer_stream);
     
-    // Free GPU buffers for the model
+    if (m_pinned_buffer) cudaFreeHost(m_pinned_buffer);
+    
+    // Return buffers to pool instead of freeing
+    auto& pool = GPUBufferPool::GetInstance();
+    if (m_raw_capture_buffer_gpu) {
+        const size_t raw_capture_size = 320 * 320 * 4;
+        pool.ReturnBuffer(m_raw_capture_buffer_gpu, raw_capture_size);
+    }
+    
+    // Return GPU buffers for the model to pool
     if (m_gpu_buffers_map.count(m_input_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_input_tensor_name]);
+        size_t input_size = m_input_height * m_input_width * 3 * sizeof(float);
+        pool.ReturnBuffer(m_gpu_buffers_map[m_input_tensor_name], input_size);
     }
     if (m_gpu_buffers_map.count(m_output_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_output_tensor_name]);
+        pool.ReturnBuffer(m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float));
     }
 }
 
@@ -78,22 +94,35 @@ bool InferenceEngine::LoadModel(const std::string& engine_path) {
     m_context.reset(m_engine->createExecutionContext());
     if (!m_context) return false;
 
-    // Clean up old buffers before allocating new ones
-    if (m_pinned_buffer) {
-        cudaFreeHost(m_pinned_buffer);
-        m_pinned_buffer = nullptr;
+    // Optimize buffer reuse - only reallocate if dimensions changed
+    auto& pool = GPUBufferPool::GetInstance();
+    
+    // Check if we can reuse existing buffers
+    bool can_reuse_buffers = (m_input_height == input_dims.d[2] && m_input_width == input_dims.d[3]);
+    
+    if (!can_reuse_buffers) {
+        // Return old buffers to pool before allocating new ones
+        if (m_pinned_buffer) {
+            cudaFreeHost(m_pinned_buffer);
+            m_pinned_buffer = nullptr;
+        }
+        if (m_raw_capture_buffer_gpu) {
+            const size_t old_raw_capture_size = 320 * 320 * 4;
+            pool.ReturnBuffer(m_raw_capture_buffer_gpu, old_raw_capture_size);
+            m_raw_capture_buffer_gpu = nullptr;
+        }
+        if (m_gpu_buffers_map.count(m_input_tensor_name)) {
+            size_t old_input_size = m_input_height * m_input_width * 3 * sizeof(float);
+            pool.ReturnBuffer(m_gpu_buffers_map[m_input_tensor_name], old_input_size);
+        }
+        if (m_gpu_buffers_map.count(m_output_tensor_name)) {
+            pool.ReturnBuffer(m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float));
+        }
+        m_gpu_buffers_map.clear();
+    } else {
+        Logger::GetInstance().Log("Reusing existing GPU buffers - dimensions unchanged");
+        return true; // Skip reallocation
     }
-    if (m_raw_capture_buffer_gpu) {
-        cudaFree(m_raw_capture_buffer_gpu);
-        m_raw_capture_buffer_gpu = nullptr;
-    }
-    if (m_gpu_buffers_map.count(m_input_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_input_tensor_name]);
-    }
-    if (m_gpu_buffers_map.count(m_output_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_output_tensor_name]);
-    }
-    m_gpu_buffers_map.clear();
     
     // Get input and output tensor dimensions
     auto input_dims = m_engine->getTensorShape(m_input_tensor_name);
@@ -110,9 +139,9 @@ bool InferenceEngine::LoadModel(const std::string& engine_path) {
         m_output_buffer_size *= output_dims.d[j];
     }
 
-    // Allocate GPU buffers for model input/output
-    cudaMalloc(&m_gpu_buffers_map[m_input_tensor_name], input_size * sizeof(float));
-    cudaMalloc(&m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float));
+    // Use buffer pool for GPU memory allocation
+    m_gpu_buffers_map[m_input_tensor_name] = pool.GetBuffer(input_size * sizeof(float));
+    m_gpu_buffers_map[m_output_tensor_name] = pool.GetBuffer(m_output_buffer_size * sizeof(float));
 
     // Allocate buffers for the raw capture and preprocessing
     // The capture resolution is hardcoded for now, matching ScreenCapture.cpp
@@ -120,7 +149,7 @@ bool InferenceEngine::LoadModel(const std::string& engine_path) {
     const int capture_height = 320;
     const size_t raw_capture_size = static_cast<size_t>(capture_width) * capture_height * 4; // BGRA
 
-    cudaMalloc(&m_raw_capture_buffer_gpu, raw_capture_size);
+    m_raw_capture_buffer_gpu = pool.GetBuffer(raw_capture_size);
     cudaHostAlloc((void**)&m_pinned_buffer, raw_capture_size, cudaHostAllocDefault);
 
     return true;

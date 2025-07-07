@@ -3,7 +3,7 @@
 #include "Aimbot.h"
 #include "Path.h"
 #include "Logger.h"
-#include "font_awesome.h"
+#include "minimal_font_awesome.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
