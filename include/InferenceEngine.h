@@ -39,26 +39,39 @@ public:
     int GetInputHeight() const;
 
 private:
-    // These are now handled by a single CUDA kernel
-    // void Letterbox(const cv::Mat& image, cv::Mat& out_image);
-    // void Normalize(cv::Mat& image);
+    // Resource management methods
+    void CleanupResources();
+    void CleanupModelBuffers();
+    void InitializeBuffers(int capture_width, int capture_height);
+    
+    // Post-processing methods
     void PostProcess(const std::vector<float>& output, std::vector<Detection>& detections, float conf_threshold, float iou_threshold, int capture_w, int capture_h, int screen_w, int screen_h);
     void NMS(std::vector<Detection>& detections, float iou_threshold);
     float IoU(const Detection& a, const Detection& b);
 
+    // TensorRT components
     std::unique_ptr<nvinfer1::IRuntime> m_runtime;
     std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
     std::unique_ptr<nvinfer1::IExecutionContext> m_context;
     
-    cudaStream_t m_stream = nullptr;
+    // CUDA streams for async operations
+    cudaStream_t m_inference_stream = nullptr;
+    cudaStream_t m_copy_stream = nullptr;
+    
+    // GPU memory buffers
     std::map<std::string, void*> m_gpu_buffers_map;
     unsigned char* m_pinned_buffer = nullptr;           // Pinned memory buffer on the host for raw capture data
     unsigned char* m_raw_capture_buffer_gpu = nullptr;  // Buffer on the GPU for the raw screen capture
+    float* m_host_output_buffer = nullptr;              // Host buffer for async output copying
 
+    // Model dimensions and configuration
     int m_input_width = 0;
     int m_input_height = 0;
+    int m_capture_width = 320;
+    int m_capture_height = 320;
     size_t m_output_buffer_size = 0;
 
+    // Tensor names
     const char* m_input_tensor_name = "images";
     const char* m_output_tensor_name = "output0";
 

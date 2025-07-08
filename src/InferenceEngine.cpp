@@ -11,6 +11,7 @@
 #include "types.h"
 #include <numeric> 
 #include <opencv2/opencv.hpp>
+#include <chrono>
 
 #ifdef max
 #undef max
@@ -29,32 +30,76 @@ void MyLogger::log(Severity severity, const char* msg) noexcept {
 
 InferenceEngine::InferenceEngine() {
     m_runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(m_logger));
-    cudaStreamCreate(&m_stream);
-
-    // The capture resolution is hardcoded for now
-    const int capture_width = 320;
-    const int capture_height = 320;
-    const size_t raw_capture_size = capture_width * capture_height * 4;
-
-    // Allocate GPU buffer for the raw capture
-    cudaMalloc(&m_raw_capture_buffer_gpu, raw_capture_size);
     
-    // Allocate Pinned Host Memory for raw capture input
-    cudaHostAlloc((void**)&m_pinned_buffer, raw_capture_size, cudaHostAllocDefault);
+    // Create multiple CUDA streams for better overlap
+    cudaStreamCreateWithFlags(&m_inference_stream, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&m_copy_stream, cudaStreamNonBlocking);
+
+    // The capture resolution is configurable now
+    InitializeBuffers(320, 320); // Default size, can be changed later
 }
 
 InferenceEngine::~InferenceEngine() {
-    if (m_stream) cudaStreamDestroy(m_stream);
-    if (m_pinned_buffer) cudaFreeHost(m_pinned_buffer);
-    if (m_raw_capture_buffer_gpu) cudaFree(m_raw_capture_buffer_gpu);
+    CleanupResources();
+}
+
+void InferenceEngine::CleanupResources() {
+    // Cleanup CUDA streams
+    if (m_inference_stream) {
+        cudaStreamSynchronize(m_inference_stream);
+        cudaStreamDestroy(m_inference_stream);
+        m_inference_stream = nullptr;
+    }
+    if (m_copy_stream) {
+        cudaStreamSynchronize(m_copy_stream);
+        cudaStreamDestroy(m_copy_stream);
+        m_copy_stream = nullptr;
+    }
+    
+    // Cleanup pinned memory
+    if (m_pinned_buffer) {
+        cudaFreeHost(m_pinned_buffer);
+        m_pinned_buffer = nullptr;
+    }
+    
+    // Cleanup GPU buffers
+    if (m_raw_capture_buffer_gpu) {
+        cudaFree(m_raw_capture_buffer_gpu);
+        m_raw_capture_buffer_gpu = nullptr;
+    }
     
     // Free GPU buffers for the model
-    if (m_gpu_buffers_map.count(m_input_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_input_tensor_name]);
+    for (auto& buffer_pair : m_gpu_buffers_map) {
+        if (buffer_pair.second) {
+            cudaFree(buffer_pair.second);
+        }
     }
-    if (m_gpu_buffers_map.count(m_output_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_output_tensor_name]);
+    m_gpu_buffers_map.clear();
+    
+    // Cleanup host output buffer
+    if (m_host_output_buffer) {
+        delete[] m_host_output_buffer;
+        m_host_output_buffer = nullptr;
     }
+}
+
+void InferenceEngine::InitializeBuffers(int capture_width, int capture_height) {
+    const size_t raw_capture_size = capture_width * capture_height * 4; // BGRA
+
+    // Allocate GPU buffer for the raw capture
+    if (cudaMalloc(&m_raw_capture_buffer_gpu, raw_capture_size) != cudaSuccess) {
+        std::cerr << "Failed to allocate raw capture buffer on GPU" << std::endl;
+        return;
+    }
+    
+    // Allocate Pinned Host Memory for raw capture input
+    if (cudaHostAlloc((void**)&m_pinned_buffer, raw_capture_size, cudaHostAllocDefault) != cudaSuccess) {
+        std::cerr << "Failed to allocate pinned host memory" << std::endl;
+        return;
+    }
+    
+    m_capture_width = capture_width;
+    m_capture_height = capture_height;
 }
 
 int InferenceEngine::GetInputHeight() const {
@@ -63,7 +108,10 @@ int InferenceEngine::GetInputHeight() const {
 
 bool InferenceEngine::LoadModel(const std::string& engine_path) {
     std::ifstream file(engine_path, std::ios::binary);
-    if (!file.good()) return false;
+    if (!file.good()) {
+        std::cerr << "Failed to open engine file: " << engine_path << std::endl;
+        return false;
+    }
 
     file.seekg(0, file.end);
     size_t size = file.tellg();
@@ -73,27 +121,19 @@ bool InferenceEngine::LoadModel(const std::string& engine_path) {
     file.close();
 
     m_engine.reset(m_runtime->deserializeCudaEngine(engine_data.data(), size));
-    if (!m_engine) return false;
+    if (!m_engine) {
+        std::cerr << "Failed to deserialize CUDA engine" << std::endl;
+        return false;
+    }
 
     m_context.reset(m_engine->createExecutionContext());
-    if (!m_context) return false;
+    if (!m_context) {
+        std::cerr << "Failed to create execution context" << std::endl;
+        return false;
+    }
 
     // Clean up old buffers before allocating new ones
-    if (m_pinned_buffer) {
-        cudaFreeHost(m_pinned_buffer);
-        m_pinned_buffer = nullptr;
-    }
-    if (m_raw_capture_buffer_gpu) {
-        cudaFree(m_raw_capture_buffer_gpu);
-        m_raw_capture_buffer_gpu = nullptr;
-    }
-    if (m_gpu_buffers_map.count(m_input_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_input_tensor_name]);
-    }
-    if (m_gpu_buffers_map.count(m_output_tensor_name)) {
-        cudaFree(m_gpu_buffers_map[m_output_tensor_name]);
-    }
-    m_gpu_buffers_map.clear();
+    CleanupModelBuffers();
     
     // Get input and output tensor dimensions
     auto input_dims = m_engine->getTensorShape(m_input_tensor_name);
@@ -110,20 +150,51 @@ bool InferenceEngine::LoadModel(const std::string& engine_path) {
         m_output_buffer_size *= output_dims.d[j];
     }
 
-    // Allocate GPU buffers for model input/output
-    cudaMalloc(&m_gpu_buffers_map[m_input_tensor_name], input_size * sizeof(float));
-    cudaMalloc(&m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float));
+    // Allocate GPU buffers for model input/output with error checking
+    if (cudaMalloc(&m_gpu_buffers_map[m_input_tensor_name], input_size * sizeof(float)) != cudaSuccess) {
+        std::cerr << "Failed to allocate input buffer" << std::endl;
+        return false;
+    }
+    
+    if (cudaMalloc(&m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float)) != cudaSuccess) {
+        std::cerr << "Failed to allocate output buffer" << std::endl;
+        return false;
+    }
 
-    // Allocate buffers for the raw capture and preprocessing
-    // The capture resolution is hardcoded for now, matching ScreenCapture.cpp
-    const int capture_width = 320;
-    const int capture_height = 320;
-    const size_t raw_capture_size = static_cast<size_t>(capture_width) * capture_height * 4; // BGRA
+    // Allocate host output buffer for async copying
+    m_host_output_buffer = new(std::nothrow) float[m_output_buffer_size];
+    if (!m_host_output_buffer) {
+        std::cerr << "Failed to allocate host output buffer" << std::endl;
+        return false;
+    }
 
-    cudaMalloc(&m_raw_capture_buffer_gpu, raw_capture_size);
-    cudaHostAlloc((void**)&m_pinned_buffer, raw_capture_size, cudaHostAllocDefault);
+    // Re-initialize capture buffers if needed
+    if (m_capture_width != 320 || m_capture_height != 320) {
+        // Clean up old buffers
+        if (m_pinned_buffer) cudaFreeHost(m_pinned_buffer);
+        if (m_raw_capture_buffer_gpu) cudaFree(m_raw_capture_buffer_gpu);
+        
+        // Reinitialize with default size
+        InitializeBuffers(320, 320);
+    }
 
     return true;
+}
+
+void InferenceEngine::CleanupModelBuffers() {
+    if (m_gpu_buffers_map.count(m_input_tensor_name) && m_gpu_buffers_map[m_input_tensor_name]) {
+        cudaFree(m_gpu_buffers_map[m_input_tensor_name]);
+        m_gpu_buffers_map.erase(m_input_tensor_name);
+    }
+    if (m_gpu_buffers_map.count(m_output_tensor_name) && m_gpu_buffers_map[m_output_tensor_name]) {
+        cudaFree(m_gpu_buffers_map[m_output_tensor_name]);
+        m_gpu_buffers_map.erase(m_output_tensor_name);
+    }
+    
+    if (m_host_output_buffer) {
+        delete[] m_host_output_buffer;
+        m_host_output_buffer = nullptr;
+    }
 }
 
 bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use_fp16, int workspace_size, std::string& error_message, std::mutex& error_mutex) {
@@ -132,7 +203,11 @@ bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use
         error_message = "Creating builder...";
     }
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(m_logger));
-    if (!builder) return false;
+    if (!builder) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        error_message = "Error: Failed to create builder!";
+        return false;
+    }
 
     const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     
@@ -141,21 +216,33 @@ bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use
         error_message = "Creating network definition...";
     }
     auto network = builder->createNetworkV2(explicitBatch);
-    if (!network) return false;
+    if (!network) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        error_message = "Error: Failed to create network!";
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(error_mutex);
         error_message = "Creating builder config...";
     }
     auto config = builder->createBuilderConfig();
-    if (!config) return false;
+    if (!config) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        error_message = "Error: Failed to create builder config!";
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(error_mutex);
         error_message = "Creating ONNX parser...";
     }
     auto parser = nvonnxparser::createParser(*network, m_logger);
-    if (!parser) return false;
+    if (!parser) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        error_message = "Error: Failed to create ONNX parser!";
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(error_mutex);
@@ -168,10 +255,15 @@ bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use
         return false;
     }
 
+    // Enhanced builder configuration
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, static_cast<size_t>(workspace_size) * 1024 * 1024);
+    
     if (use_fp16) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
     }
+    
+    // Enable optimizations
+    config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
     
     {
         std::lock_guard<std::mutex> lock(error_mutex);
@@ -179,7 +271,11 @@ bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use
     }
     std::cout << "Building TensorRT engine... (This may take a while)" << std::endl;
     
+    auto start_time = std::chrono::high_resolution_clock::now();
     nvinfer1::IHostMemory* plan = builder->buildSerializedNetwork(*network, *config);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+    
     if (!plan) {
         std::lock_guard<std::mutex> lock(error_mutex);
         error_message = "Error: Failed to build serialized network!";
@@ -190,39 +286,48 @@ bool InferenceEngine::BuildEngineFromOnnx(const std::string& onnx_path, bool use
         std::lock_guard<std::mutex> lock(error_mutex);
         error_message = "Saving engine to file...";
     }
+    
     // Save engine to file
     std::string enginePath = onnx_path.substr(0, onnx_path.find_last_of('.')) + ".engine";
     std::ofstream engineFile(enginePath, std::ios::binary);
+    if (!engineFile) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        error_message = "Error: Failed to create engine file!";
+        delete plan;
+        return false;
+    }
+    
     engineFile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
+    engineFile.close();
 
-    std::cout << "Engine built and saved to " << enginePath << std::endl;
+    std::cout << "Engine built and saved to " << enginePath << " (took " << duration.count() << " seconds)" << std::endl;
 
     // Cleanup
     delete plan;
     delete parser;
     delete config;
     delete network;
-    // builder is a unique_ptr and is destroyed automatically
 
     return true;
 }
 
 float InferenceEngine::IoU(const Detection& a, const Detection& b) {
-    float x1 = a.xmin > b.xmin ? static_cast<float>(a.xmin) : static_cast<float>(b.xmin);
-    float y1 = a.ymin > b.ymin ? static_cast<float>(a.ymin) : static_cast<float>(b.ymin);
-    float x2 = a.xmax < b.xmax ? static_cast<float>(a.xmax) : static_cast<float>(b.xmax);
-    float y2 = a.ymax < b.ymax ? static_cast<float>(a.ymax) : static_cast<float>(b.ymax);
-    float intersection_w = x2 > x1 ? x2 - x1 : 0.0f;
-    float intersection_h = y2 > y1 ? y2 - y1 : 0.0f;
-    float intersection_area = intersection_w * intersection_h;
+    const float x1 = std::max(static_cast<float>(a.xmin), static_cast<float>(b.xmin));
+    const float y1 = std::max(static_cast<float>(a.ymin), static_cast<float>(b.ymin));
+    const float x2 = std::min(static_cast<float>(a.xmax), static_cast<float>(b.xmax));
+    const float y2 = std::min(static_cast<float>(a.ymax), static_cast<float>(b.ymax));
+    
+    const float intersection_w = std::max(0.0f, x2 - x1);
+    const float intersection_h = std::max(0.0f, y2 - y1);
+    const float intersection_area = intersection_w * intersection_h;
 
     if (intersection_area == 0.0f) return 0.0f;
 
-    float area_a = (a.xmax - a.xmin) * (a.ymax - a.ymin);
-    float area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
-    float union_area = area_a + area_b - intersection_area;
+    const float area_a = (a.xmax - a.xmin) * (a.ymax - a.ymin);
+    const float area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
+    const float union_area = area_a + area_b - intersection_area;
 
-    return intersection_area / union_area;
+    return union_area > 0.0f ? intersection_area / union_area : 0.0f;
 }
 
 void InferenceEngine::NMS(std::vector<Detection>& detections, float iou_threshold) {
@@ -234,11 +339,14 @@ void InferenceEngine::NMS(std::vector<Detection>& detections, float iou_threshol
     });
 
     std::vector<Detection> kept_detections;
+    kept_detections.reserve(detections.size()); // Pre-allocate for efficiency
+    
     std::vector<bool> is_suppressed(detections.size(), false);
 
     for (size_t i = 0; i < detections.size(); ++i) {
         if (is_suppressed[i]) continue;
         kept_detections.push_back(detections[i]);
+        
         for (size_t j = i + 1; j < detections.size(); ++j) {
             if (is_suppressed[j]) continue;
             if (IoU(detections[i], detections[j]) > iou_threshold) {
@@ -246,7 +354,7 @@ void InferenceEngine::NMS(std::vector<Detection>& detections, float iou_threshol
             }
         }
     }
-    detections = kept_detections;
+    detections = std::move(kept_detections);
 }
 
 void InferenceEngine::PostProcess(const std::vector<float>& output, std::vector<Detection>& detections, float conf_threshold, float iou_threshold, int capture_w, int capture_h, int screen_w, int screen_h) {
@@ -255,22 +363,24 @@ void InferenceEngine::PostProcess(const std::vector<float>& output, std::vector<
     const int num_detections = 2100;
 
     // Calculate the offset of the capture area from the top-left of the screen
-    int offset_x = (screen_w - capture_w) / 2;
-    int offset_y = (screen_h - capture_h) / 2;
+    const int offset_x = (screen_w - capture_w) / 2;
+    const int offset_y = (screen_h - capture_h) / 2;
 
     std::vector<Detection> candidates;
+    candidates.reserve(num_detections); // Pre-allocate for efficiency
+    
     for (int i = 0; i < num_detections; ++i) {
-        float confidence = output[i + 4 * num_detections];
+        const float confidence = output[i + 4 * num_detections];
         if (confidence < conf_threshold) {
             continue;
-    }
+        }
 
-        // The model's output coordinates are relative to the 320x320 capture area.
+        // The model's output coordinates are relative to the capture area.
         // We need to add the offset to map them to the full screen space.
-        float model_xc = output[i];
-        float model_yc = output[i + num_detections];
-        float model_w = output[i + 2 * num_detections];
-        float model_h = output[i + 3 * num_detections];
+        const float model_xc = output[i];
+        const float model_yc = output[i + num_detections];
+        const float model_w = output[i + 2 * num_detections];
+        const float model_h = output[i + 3 * num_detections];
 
         Detection det;
         det.x_center = static_cast<int>(model_xc + offset_x);
@@ -287,7 +397,7 @@ void InferenceEngine::PostProcess(const std::vector<float>& output, std::vector<
     }
 
     NMS(candidates, iou_threshold);
-    detections = candidates;
+    detections = std::move(candidates);
 }
 
 void InferenceEngine::Infer(
@@ -298,42 +408,52 @@ void InferenceEngine::Infer(
     float confidence_threshold,
     float iou_threshold
 ) {
-    if (!m_context) return;
+    if (!m_context) {
+        std::cerr << "Inference context not ready" << std::endl;
+        return;
+    }
 
-    // The input buffer is already preprocessed and on the device.
-    // We can directly use it for inference.
-    if (!m_context->setTensorAddress(m_input_tensor_name, device_input_buffer))
-    {
+    // Set tensor addresses
+    if (!m_context->setTensorAddress(m_input_tensor_name, device_input_buffer)) {
         m_logger.log(nvinfer1::ILogger::Severity::kERROR, "Failed to set input tensor address.");
         return;
     }
-    if (!m_context->setTensorAddress(m_output_tensor_name, m_gpu_buffers_map[m_output_tensor_name]))
-    {
+    if (!m_context->setTensorAddress(m_output_tensor_name, m_gpu_buffers_map[m_output_tensor_name])) {
         m_logger.log(nvinfer1::ILogger::Severity::kERROR, "Failed to set output tensor address.");
         return;
     }
 
-    // Run inference
-    if (!m_context->enqueueV3(m_stream)) {
+    // Run inference asynchronously
+    if (!m_context->enqueueV3(m_inference_stream)) {
         m_logger.log(nvinfer1::ILogger::Severity::kERROR, "Failed to enqueue inference.");
         return;
     }
 
-    // Synchronize stream to wait for inference to complete
-    cudaStreamSynchronize(m_stream);
+    // Copy output from device to host asynchronously
+    cudaError_t err = cudaMemcpyAsync(
+        m_host_output_buffer, 
+        m_gpu_buffers_map[m_output_tensor_name], 
+        m_output_buffer_size * sizeof(float), 
+        cudaMemcpyDeviceToHost, 
+        m_copy_stream
+    );
+    
+    if (err != cudaSuccess) {
+        std::cerr << "Failed to copy output data: " << cudaGetErrorString(err) << std::endl;
+        return;
+    }
 
-    // Copy output from device to host
-    std::vector<float> host_output(m_output_buffer_size);
-    CUDA_CHECK(cudaMemcpyAsync(host_output.data(), m_gpu_buffers_map[m_output_tensor_name], m_output_buffer_size * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+    // Synchronize only the copy stream for minimal blocking
+    cudaStreamSynchronize(m_copy_stream);
 
-    // Post-processing on the CPU
-    PostProcess(host_output, detections, confidence_threshold, iou_threshold, GetInputWidth(), GetInputHeight(), screen_w, screen_h);
+    // Post-processing on the CPU using the host buffer
+    std::vector<float> output_vector(m_host_output_buffer, m_host_output_buffer + m_output_buffer_size);
+    PostProcess(output_vector, detections, confidence_threshold, iou_threshold, GetInputWidth(), GetInputHeight(), screen_w, screen_h);
 }
 
 bool InferenceEngine::IsReady() const {
     return m_context != nullptr;
-    }
+}
 
 int InferenceEngine::GetInputWidth() const {
     return m_input_width;

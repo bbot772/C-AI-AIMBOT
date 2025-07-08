@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <memory>
 #include <filesystem>
+#include <deque>
+#include <chrono>
 #include "ConfigManager.h"
 #include "AimingSettings.h"
 #include "ScreenCapture.h"
@@ -58,6 +60,9 @@ public:
     
     std::string GetBuildStatus() const;
     
+    // Performance monitoring
+    int GetAdaptiveFrameRate() const;
+    
     // Public members for easy access from UI
     AimingSettings m_aiming_settings;
     PersonalizationSettings m_personalization_settings;
@@ -79,7 +84,7 @@ public:
     const int m_capture_width = 320;
     const int m_capture_height = 320;
     float* m_preprocessed_buffer_gpu = nullptr;
-    cudaGraphicsResource* m_cuda_graphics_resource = nullptr;
+    cudaGraphicsResource_t m_cuda_graphics_resource = nullptr;
 
     // Plotting Data
     std::mutex plot_data_mutex;
@@ -94,9 +99,15 @@ public:
 private:
     void InferenceThread();
     void BuildEngineThread(const std::string& onnx_path, bool use_fp16, int ws_size);
+    void CleanupResources();
+    void UpdateAdaptiveFrameRate(std::chrono::microseconds frame_time);
 
     std::atomic<bool> m_running{false};
     std::thread m_inference_thread;
+
+    // Adaptive frame rate control
+    std::atomic<int> m_adaptive_frame_rate{144};
+    std::deque<long long> m_frame_time_history;
 
     // Must be declared after m_aiming_settings
     std::unique_ptr<InferenceEngine> m_inference_engine;
