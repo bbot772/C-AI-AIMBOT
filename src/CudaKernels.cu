@@ -2,91 +2,126 @@
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
 #include "Logger.h"
+#include <unordered_map>
+#include <mutex>
+
+// Global resource cache for persistent graphics resources
+static std::unordered_map<ID3D11Texture2D*, cudaGraphicsResource_t> g_resource_cache;
+static std::mutex g_resource_cache_mutex;
+
+// Optimized CUDA error checking macro
+#define CUDA_CHECK_OPTIMIZED(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        Logger::GetInstance().Log("CUDA error at %s:%d - %s", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        return false; \
+    } \
+} while(0)
 
 /**
- * @brief CUDA kernel to preprocess a raw image for inference.
- *
- * This kernel is executed by a grid of thread blocks. Each thread is responsible
- * for computing the value of a single pixel in the destination (output) tensor.
- * It maps the destination pixel back to the source image, applies letterbox
- * padding if necessary, normalizes the pixel value, and writes it to the
- * correct position in the CHW-formatted output buffer.
+ * @brief Optimized CUDA kernel for image preprocessing with improved memory access patterns
  */
-__global__ void PreprocessKernel(cudaTextureObject_t inputTexture, float* output, int img_w, int img_h, int output_w, int output_h)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void PreprocessKernelOptimized(
+    cudaTextureObject_t inputTexture, 
+    float* __restrict__ output, 
+    int img_w, 
+    int img_h, 
+    int output_w, 
+    int output_h
+) {
+    // Use 2D thread indexing for better memory coalescing
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= output_w || y >= output_h) {
-        return;
-    }
+    if (x >= output_w || y >= output_h) return;
 
-    float scale = min(static_cast<float>(output_w) / img_w, static_cast<float>(output_h) / img_h);
-    int new_w = static_cast<int>(img_w * scale);
-    int new_h = static_cast<int>(img_h * scale);
-    int pad_x = (output_w - new_w) / 2;
-    int pad_y = (output_h - new_h) / 2;
+    // Precompute scale and padding (these are constant for all threads)
+    const float scale = fminf(static_cast<float>(output_w) / img_w, static_cast<float>(output_h) / img_h);
+    const int new_w = __float2int_rz(img_w * scale);
+    const int new_h = __float2int_rz(img_h * scale);
+    const int pad_x = (output_w - new_w) >> 1;  // Bit shift for division by 2
+    const int pad_y = (output_h - new_h) >> 1;
 
-    int input_x = (x - pad_x) / scale;
-    int input_y = (y - pad_y) / scale;
+    // Calculate input coordinates with improved precision
+    const float input_x_f = (x - pad_x) / scale;
+    const float input_y_f = (y - pad_y) / scale;
 
-    float r_norm = 0.5f, g_norm = 0.5f, b_norm = 0.5f; // Default to padding color (grey)
+    float3 rgb_norm = make_float3(0.5f, 0.5f, 0.5f); // Default padding color
 
-    if (x >= pad_x && x < pad_x + new_w && y >= pad_y && y < pad_y + new_h) {
-        // tex2D with cudaReadModeNormalizedFloat gives us BGRA values in the [0.0, 1.0] range.
-        float4 pixel = tex2D<float4>(inputTexture, (input_x + 0.5f) / img_w, (input_y + 0.5f) / img_h);
+    // Check bounds and sample texture
+    if (x >= pad_x && x < pad_x + new_w && y >= pad_y && y < pad_y + new_h && 
+        input_x_f >= 0 && input_x_f < img_w && input_y_f >= 0 && input_y_f < img_h) {
         
-        // No need to divide by 255.0f again. Just swizzle from BGRA to RGB for the model.
-        r_norm = pixel.z; // R channel
-        g_norm = pixel.y; // G channel
-        b_norm = pixel.x; // B channel
+        // Optimized texture sampling with hardware interpolation
+        const float4 pixel = tex2D<float4>(inputTexture, 
+            (input_x_f + 0.5f) / img_w, 
+            (input_y_f + 0.5f) / img_h);
+        
+        // Swizzle BGRA to RGB
+        rgb_norm.x = pixel.z; // R
+        rgb_norm.y = pixel.y; // G
+        rgb_norm.z = pixel.x; // B
     }
 
-    // NCHW format
-    output[0 * output_h * output_w + y * output_w + x] = r_norm; // R channel
-    output[1 * output_h * output_w + y * output_w + x] = g_norm; // G channel
-    output[2 * output_h * output_w + y * output_w + x] = b_norm; // B channel
+    // Optimized memory write pattern (NCHW format)
+    const int base_idx = y * output_w + x;
+    const int channel_size = output_h * output_w;
+    
+    output[base_idx] = rgb_norm.x;                    // R channel
+    output[channel_size + base_idx] = rgb_norm.y;     // G channel
+    output[2 * channel_size + base_idx] = rgb_norm.z; // B channel
 }
 
-bool PreprocessD3D11Texture(ID3D11Texture2D* pTexture, float* d_processed_output, int texture_w, int texture_h, int output_w, int output_h, cudaGraphicsResource** ppCudaResource)
-{
-    cudaError_t err;
+/**
+ * @brief Optimized D3D11 texture preprocessing with persistent resource management
+ */
+bool PreprocessD3D11TextureOptimized(
+    ID3D11Texture2D* pTexture, 
+    float* d_processed_output, 
+    int texture_w, 
+    int texture_h, 
+    int output_w, 
+    int output_h, 
+    cudaGraphicsResource_t* ppCudaResource,
+    cudaStream_t stream = 0
+) {
+    if (!pTexture || !d_processed_output) return false;
 
-    // Unregister previous resource if it exists
-    if (*ppCudaResource != nullptr) {
-        cudaGraphicsUnregisterResource(*ppCudaResource);
-        *ppCudaResource = nullptr;
-    }
-    
-    // Register the D3D11 texture as a CUDA graphics resource
-    err = cudaGraphicsD3D11RegisterResource(ppCudaResource, pTexture, cudaGraphicsRegisterFlagsNone);
-    if (err != cudaSuccess) {
-        Logger::GetInstance().Log("cudaGraphicsD3D11RegisterResource failed: %s", cudaGetErrorString(err));
-        return false;
+    cudaGraphicsResource_t cudaResource = nullptr;
+    bool resource_cached = false;
+
+    // Check if resource is already cached
+    {
+        std::lock_guard<std::mutex> lock(g_resource_cache_mutex);
+        auto it = g_resource_cache.find(pTexture);
+        if (it != g_resource_cache.end()) {
+            cudaResource = it->second;
+            resource_cached = true;
+        }
     }
 
-    // Map the resource to access it from CUDA
-    err = cudaGraphicsMapResources(1, ppCudaResource, 0);
-    if (err != cudaSuccess) {
-        Logger::GetInstance().Log("cudaGraphicsMapResources failed: %s", cudaGetErrorString(err));
-        return false;
+    // Register resource if not cached
+    if (!resource_cached) {
+        CUDA_CHECK_OPTIMIZED(cudaGraphicsD3D11RegisterResource(
+            &cudaResource, pTexture, cudaGraphicsRegisterFlagsReadOnly));
+        
+        // Cache the resource
+        std::lock_guard<std::mutex> lock(g_resource_cache_mutex);
+        g_resource_cache[pTexture] = cudaResource;
     }
+
+    // Map resource for CUDA access
+    CUDA_CHECK_OPTIMIZED(cudaGraphicsMapResources(1, &cudaResource, stream));
 
     cudaArray* cuArray;
-    err = cudaGraphicsSubResourceGetMappedArray(&cuArray, *ppCudaResource, 0, 0);
-    if (err != cudaSuccess) {
-        Logger::GetInstance().Log("cudaGraphicsSubResourceGetMappedArray failed: %s", cudaGetErrorString(err));
-        return false;
-    }
+    CUDA_CHECK_OPTIMIZED(cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0));
 
-    // Create a texture object to read from the CUDA array
-    struct cudaResourceDesc resDesc;
-    memset(&resDesc, 0, sizeof(resDesc));
+    // Create texture object with optimized settings
+    cudaResourceDesc resDesc = {};
     resDesc.resType = cudaResourceTypeArray;
     resDesc.res.array.array = cuArray;
 
-    struct cudaTextureDesc texDesc;
-    memset(&texDesc, 0, sizeof(texDesc));
+    cudaTextureDesc texDesc = {};
     texDesc.addressMode[0] = cudaAddressModeClamp;
     texDesc.addressMode[1] = cudaAddressModeClamp;
     texDesc.filterMode = cudaFilterModeLinear;
@@ -94,29 +129,102 @@ bool PreprocessD3D11Texture(ID3D11Texture2D* pTexture, float* d_processed_output
     texDesc.normalizedCoords = 1;
 
     cudaTextureObject_t texObj = 0;
-    err = cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL);
-     if (err != cudaSuccess) {
-        Logger::GetInstance().Log("cudaCreateTextureObject failed: %s", cudaGetErrorString(err));
-        cudaGraphicsUnmapResources(1, ppCudaResource, 0);
+    CUDA_CHECK_OPTIMIZED(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
+
+    // Launch optimized kernel with better occupancy
+    const dim3 block(16, 16);
+    const dim3 grid((output_w + block.x - 1) / block.x, (output_h + block.y - 1) / block.y);
+
+    PreprocessKernelOptimized<<<grid, block, 0, stream>>>(
+        texObj, d_processed_output, texture_w, texture_h, output_w, output_h);
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Logger::GetInstance().Log("Kernel launch failed: %s", cudaGetErrorString(err));
+        cudaDestroyTextureObject(texObj);
+        cudaGraphicsUnmapResources(1, &cudaResource, stream);
         return false;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((output_w + block.x - 1) / block.x, (output_h + block.y - 1) / block.y);
+    // Cleanup texture object and unmap resource
+    CUDA_CHECK_OPTIMIZED(cudaDestroyTextureObject(texObj));
+    CUDA_CHECK_OPTIMIZED(cudaGraphicsUnmapResources(1, &cudaResource, stream));
 
-    PreprocessKernel<<<grid, block>>>(texObj, d_processed_output, texture_w, texture_h, output_w, output_h);
-
-    cudaDestroyTextureObject(texObj);
-    cudaGraphicsUnmapResources(1, ppCudaResource, 0);
-    
-    // The resource should be unregistered when it's no longer needed, typically on cleanup.
-    // We leave it registered for the lifetime of the texture.
+    // Store resource handle if requested
+    if (ppCudaResource) {
+        *ppCudaResource = cudaResource;
+    }
 
     return true;
 }
 
+/**
+ * @brief Backward compatibility wrapper for existing code
+ */
+bool PreprocessD3D11Texture(
+    ID3D11Texture2D* pTexture, 
+    float* d_processed_output, 
+    int texture_w, 
+    int texture_h, 
+    int output_w, 
+    int output_h, 
+    cudaGraphicsResource** ppCudaResource
+) {
+    cudaGraphicsResource_t resource = nullptr;
+    bool result = PreprocessD3D11TextureOptimized(
+        pTexture, d_processed_output, texture_w, texture_h, 
+        output_w, output_h, &resource, 0);
+    
+    if (ppCudaResource) {
+        *ppCudaResource = resource;
+    }
+    
+    return result;
+}
+
+/**
+ * @brief Enhanced buffer allocation with alignment optimization
+ */
 float* AllocatePreprocessedBuffer(int width, int height) {
-    float* d_buffer;
-    cudaMalloc(&d_buffer, 3 * width * height * sizeof(float));
+    float* d_buffer = nullptr;
+    const size_t size = 3 * static_cast<size_t>(width) * height * sizeof(float);
+    
+    // Use aligned allocation for better memory performance
+    cudaError_t err = cudaMalloc(&d_buffer, size);
+    if (err != cudaSuccess) {
+        Logger::GetInstance().Log("Failed to allocate preprocessed buffer: %s", cudaGetErrorString(err));
+        return nullptr;
+    }
+    
+    // Initialize buffer to zero for consistent behavior
+    cudaMemset(d_buffer, 0, size);
+    
     return d_buffer;
+}
+
+/**
+ * @brief Cleanup cached graphics resources
+ */
+void CleanupGraphicsResourceCache() {
+    std::lock_guard<std::mutex> lock(g_resource_cache_mutex);
+    
+    for (auto& pair : g_resource_cache) {
+        cudaGraphicsUnregisterResource(pair.second);
+    }
+    
+    g_resource_cache.clear();
+}
+
+/**
+ * @brief Remove specific resource from cache (call when texture is destroyed)
+ */
+void RemoveFromResourceCache(ID3D11Texture2D* pTexture) {
+    std::lock_guard<std::mutex> lock(g_resource_cache_mutex);
+    
+    auto it = g_resource_cache.find(pTexture);
+    if (it != g_resource_cache.end()) {
+        cudaGraphicsUnregisterResource(it->second);
+        g_resource_cache.erase(it);
+    }
 } 

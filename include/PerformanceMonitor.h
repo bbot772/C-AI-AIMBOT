@@ -1,22 +1,22 @@
 // include/PerformanceMonitor.h
 #pragma once
 
-#include <string>
-#include <vector>
-#include <thread>
-#include <mutex>
-#include <atomic>
 #include <nvml.h>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <deque>
 
 struct GpuMetrics {
-    std::string   deviceName;
-    unsigned int  temperature;
-    unsigned int  utilizationGpu;
-    unsigned int  utilizationMemory;
-    unsigned long long memoryTotal;
-    unsigned long long memoryUsed;
-    unsigned int  powerUsage;
-    unsigned int  powerLimit;
+    std::string deviceName;
+    unsigned int temperature = 0;
+    unsigned int utilizationGpu = 0;
+    unsigned int utilizationMemory = 0;
+    unsigned long long memoryUsed = 0;
+    unsigned long long memoryTotal = 0;
+    unsigned int powerUsage = 0;
+    unsigned int powerLimit = 0;
 };
 
 class PerformanceMonitor {
@@ -26,16 +26,31 @@ public:
 
     bool Init();
     void Shutdown();
+    
     GpuMetrics GetMetrics();
+    
+    // Enhanced monitoring features
+    void SetUpdateInterval(int interval_ms);
+    float GetGpuUtilizationSmoothed();
+    bool IsGpuOverloaded();
 
 private:
     void WorkerLoop();
+    void UpdateMetrics(GpuMetrics& metrics);
 
-    bool m_initialized = false;
+    bool m_initialized;
     nvmlDevice_t m_device;
-    GpuMetrics m_metrics;
-
+    
+    // Threading
     std::thread m_worker_thread;
-    std::mutex m_metrics_mutex;
     std::atomic<bool> m_stop_worker;
+    
+    // Metrics and synchronization
+    GpuMetrics m_metrics;
+    std::mutex m_metrics_mutex;
+    
+    // Performance optimization
+    int m_update_interval_ms;
+    unsigned int m_static_power_limit = 0; // Cached power limit
+    std::deque<unsigned int> m_gpu_utilization_history;
 };
